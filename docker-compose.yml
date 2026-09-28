@@ -1,0 +1,17 @@
+services:
+  navlight:
+    build: .
+    image: navlight-inspector:latest
+    container_name: navlight-inspector
+    ports:
+      - "8000:8000"
+    environment:
+      NAVLIGHT_DB_PATH: /app/data/navlight.db
+      NAVLIGHT_GRID_MAX_STEPS: "201"
+      NAVLIGHT_SEED_TOP_K: "5"
+    volumes:
+      - navlight-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  navlight-data:

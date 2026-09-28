@@ -1,0 +1,9 @@
+{
+  "aids": [
+    {"aid_id": "CN-001", "period": 10.0, "flashes": [0.0, 1.5]},
+    {"aid_id": "CN-002", "period": 15.0, "flashes": [0.0, 1.0, 2.0]},
+    {"aid_id": "CN-003", "period": 6.0, "flashes": [0.0]},
+    {"aid_id": "CN-004", "period": 12.0, "flashes": [0.0, 0.8, 5.0, 5.8]}
+  ],
+  "mode": "merge"
+}
