@@ -24,6 +24,15 @@
 （不新增批次、不推进链头、不改写首次受理响应），返回原结果（`status=replayed`），
 载荷变化或链头过期返回 409 及期望值，并发提交与并发重放都不会形成分叉或丢计数。
 
+同一台设备的批次会被**多个下游处理方（必需消费者）**消费：处理方先登记
+（登记永久有效、不可删除），处理完一批后携带 `consumer_id`、`sequence` 与
+`batch_digest` 确认。确认允许乱序（稀疏确认，缺号只阻塞该处理方自己的水位）、
+并发与重复提交；仅接受已存在且摘要相符的批次，相同确认幂等，摘要冲突返回 409。
+每个处理方的稀疏确认与连续水位推进在**同一 SQLite 事务**内完成，并发确认不丢
+推进；设备的 `safe_sequence` 取全部必需消费者水位的最小值（无消费者或任一
+消费者未确认前缀时为 0），即**全部处理完成、可安全归档的连续前缀**，确认
+全程不删除、不改写任何原批次。
+
 ## 快速开始
 
 单条命令启动（唯一前置要求：Docker 与 Docker Compose）：
@@ -74,6 +83,9 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `GET` | `/field-devices/{device_id}/cursor` | 查询设备批次链游标（链头摘要、下一批期望值与最近事件状态/序号/时刻） |
 | `GET` | `/field-devices/{device_id}/batches` | 按 `after_sequence` 游标分页列出设备批次（首次受理状态 + 重放计数） |
 | `GET` | `/field-devices/{device_id}/batches/{sequence}` | 查询单条批次详情（观测时间戳、`/judge` 四项阈值与重放计数） |
+| `POST` | `/field-devices/{device_id}/consumers` | 登记必需消费者（下游处理方）；登记永久有效、不可删除，重复登记幂等 |
+| `POST` | `/field-devices/{device_id}/confirmations` | 消费者确认批次（`consumer_id`/`sequence`/`batch_digest`）；乱序/并发/重复安全，冲突 409 |
+| `GET` | `/field-devices/{device_id}/consumer-status` | 查询各消费者水位、首个缺口、阻塞消费者与可安全归档前缀 `safe_sequence` |
 
 ### 1. 导入特征库（原子发布新版本）
 
@@ -396,6 +408,127 @@ curl -s "http://localhost:8000/field-devices/dev-01/batches?after_sequence=2&lim
 curl -s http://localhost:8000/field-devices/dev-01/batches/2
 ```
 
+### 7. 多处理方确认与可安全归档前缀（safe_sequence）
+
+设备批次会被多个下游处理方消费（例如：质检判定、数据入湖、长期归档各一个）。
+只有**全部必需消费者**都连续处理完某个前缀后，该前缀才允许安全归档。处理方
+先登记，再按自己的处理节奏确认批次：
+
+- **登记永久有效、不可删除**：一旦登记即参与 `safe_sequence` 取最小值，没有
+  注销接口；重复登记同一 `consumer_id` 幂等（`status=already_registered`）；
+- **确认携带** `consumer_id`、`sequence`、`batch_digest`（批次上传响应里的
+  `digest`，大小写不敏感地按十六进制小写规范化）；
+- **允许乱序**：消费者可以先确认第 2、3 批再补第 1 批，缺号只阻塞该消费者
+  自己的连续水位，不影响其他消费者，也不丢弃越序确认；
+- **允许并发与重复**：同一消费者的确认可并发提交，相同确认重放幂等
+  （`status=already_confirmed`，HTTP 200，不写任何状态）；
+- **仅接受已存在且摘要相符的批次**：消费者未登记或批次不存在返回 404；
+  摘要与服务端批次摘要不符返回 409 并附 `expected_digest`；同一序号已以
+  **不同**摘要确认同样返回 409（附既有摘要 `existing_digest`，确认不可变）。
+
+**水位与安全前缀**：每个消费者维护一条连续确认水位 `watermark`
+（`1..watermark` 全部确认），由其稀疏确认集合在同一事务内重算并推进到首个
+缺口；设备的 `safe_sequence = min(各消费者 watermark)`——尚无消费者或任一
+消费者未确认前缀时为 `0`。状态接口另外给出首个缺口与阻塞消费者；确认全程
+**不删除、不改写任何原批次**，批次链与批次查询接口行为不变。
+
+**多处理方确认示例**（设备 `dev-01`，两个处理方 `qc` 与 `lake`，批次 1～3
+已按第 6 节上传，摘要分别记为 `$D1/$D2/$D3`）：
+
+```bash
+# ① 登记两个必需消费者（登记后不可删除；重复登记返回 200 already_registered）
+curl -s -X POST http://localhost:8000/field-devices/dev-01/consumers \
+  -H 'Content-Type: application/json' -d '{"consumer_id": "qc"}'
+# → 201 {"status": "registered", "consumer_id": "qc", "watermark": 0,
+#        "registered_at": "…", "safe_sequence": 0, "consumer_count": 1}
+curl -s -X POST http://localhost:8000/field-devices/dev-01/consumers \
+  -H 'Content-Type: application/json' -d '{"consumer_id": "lake"}'
+
+# ② 乱序确认：qc 处理得快，先确认 2、3（缺 1，水位仍停在 0）
+curl -s -X POST http://localhost:8000/field-devices/dev-01/confirmations \
+  -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "qc", "sequence": 2, "batch_digest": "'"$D2"'"}'
+# → 201 {"status": "confirmed", "consumer_id": "qc", "sequence": 2,
+#        "watermark": 0, "safe_sequence": 0, "first_gap": 1,
+#        "blocking_consumers": ["lake", "qc"], …}
+curl -s -X POST http://localhost:8000/field-devices/dev-01/confirmations \
+  -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "qc", "sequence": 3, "batch_digest": "'"$D3"'"}'
+
+# lake 按顺序确认 1：lake 水位 1，但 qc 缺 1 → safe_sequence 仍为 0
+curl -s -X POST http://localhost:8000/field-devices/dev-01/confirmations \
+  -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "lake", "sequence": 1, "batch_digest": "'"$D1"'"}'
+# → 201 {"watermark": 1, "safe_sequence": 0, "first_gap": 1, …}
+
+# ③ qc 补上批次 1：稀疏集合重算，水位一次跃到 3；safe=min(3,1)=1
+curl -s -X POST http://localhost:8000/field-devices/dev-01/confirmations \
+  -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "qc", "sequence": 1, "batch_digest": "'"$D1"'"}'
+# → 201 {"watermark": 3, "safe_sequence": 1, "first_gap": 2,
+#        "blocking_consumers": ["lake"], …}
+
+# ④ 相同确认重放：幂等 200，不改变任何状态
+curl -s -X POST http://localhost:8000/field-devices/dev-01/confirmations \
+  -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "qc", "sequence": 1, "batch_digest": "'"$D1"'"}'
+# → 200 {"status": "already_confirmed", "watermark": 3, …}
+
+# 摘要不符（批次不存在或消费者未登记 → 404）：
+curl -s -X POST http://localhost:8000/field-devices/dev-01/confirmations \
+  -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "qc", "sequence": 1, "batch_digest": "'"$(printf '00%.0s' {1..32})"'"}'
+# → 409 {"detail": {"error": "ack_conflict", "reason": "batch_digest_mismatch",
+#                   "expected_digest": "<D1>", …}}
+
+# ⑤ lake 补齐 2、3：safe_sequence 到达 3，前缀 1..3 可安全归档
+curl -s -X POST http://localhost:8000/field-devices/dev-01/confirmations \
+  -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "lake", "sequence": 2, "batch_digest": "'"$D2"'"}'
+curl -s -X POST http://localhost:8000/field-devices/dev-01/confirmations \
+  -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "lake", "sequence": 3, "batch_digest": "'"$D3"'"}'
+
+# ⑥ 随时查询各消费者水位、首个缺口与阻塞消费者
+curl -s http://localhost:8000/field-devices/dev-01/consumer-status
+```
+
+最后一次状态响应：
+
+```json
+{
+  "device_id": "dev-01",
+  "head_sequence": 3,
+  "safe_sequence": 3,
+  "first_gap": 4,
+  "blocking_consumers": [],
+  "consumer_count": 2,
+  "consumers": [
+    {"consumer_id": "lake", "watermark": 3, "first_gap": 4,
+     "blocking": false, "registered_at": "…"},
+    {"consumer_id": "qc", "watermark": 3, "first_gap": 4,
+     "blocking": false, "registered_at": "…"}
+  ]
+}
+```
+
+状态字段说明：
+
+| 字段 | 说明 |
+| --- | --- |
+| `safe_sequence` | 全部必需消费者连续确认水位的最小值，即全部处理完成、**可安全归档的连续前缀**；无消费者或任一消费者未确认前缀时为 `0` |
+| `first_gap` | 各消费者首个缺口（`watermark + 1`）的最小值，即所有人共同缺的第一批 |
+| `head_sequence` | 设备批次链链头序号（来自批次链游标） |
+| `blocking_consumers` | 阻塞 `safe_sequence` 的消费者：其首个缺口落在**已存在**批次上（尚未追平链头）；已追平（缺口尚无对应批次）不计入 |
+| `consumers[].watermark` | 该消费者已连续确认到的水位（`1..watermark` 均已确认） |
+| `consumers[].first_gap` | 该消费者的首个缺口序号；补确认后由稀疏集合重算水位，乱序补缺会一次跃过缺口 |
+| `consumers[].blocking` | 该消费者当前是否阻塞 `safe_sequence` |
+
+并发语义：稀疏确认的保存与水位推进在**同一个 SQLite 事务**内完成（写锁 +
+`BEGIN IMMEDIATE`），水位始终由稀疏确认集合重新推导（而非读旧值 +1），所以
+并发确认串行化提交、乱序补缺只进不退，**不会丢失水位推进**；事后新登记的
+消费者会立即把 `safe_sequence` 拉低，直到它补齐同样的连续前缀。
+
 ## 判定模型与裁决规则
 
 **观测模型**：观测时钟相对真时存在线性钟漂与固定相位差，
@@ -445,7 +578,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链共 55 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多处理方确认共 78 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 
@@ -458,7 +591,7 @@ app/
   patrol.py  巡检整体核对：窗口合格候选 + 全局最优分配动态规划
   batches.py 现场设备批次：规范化载荷与 SHA-256 链式摘要
   models.py  请求数据模型（Pydantic）
-  db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 设备批次链，含首次迁移）
+  db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 设备批次链 + 多处理方稀疏确认/水位，含首次迁移）
   config.py  环境变量配置
 samples/
   library.json                示例特征库

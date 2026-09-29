@@ -144,6 +144,41 @@ class BatchObservationIn(BaseModel):
         return v
 
 
+class ConsumerRegisterRequest(BaseModel):
+    """登记设备批次的必需消费者（下游处理方）。
+
+    登记是设备作用域内的永久事实：一旦登记即参与 ``safe_sequence`` 取最小值，
+    不提供删除/注销接口；重复登记同一 ``consumer_id`` 幂等返回
+    ``already_registered``，保留首次登记时刻。
+    """
+
+    consumer_id: str = Field(
+        min_length=1, max_length=128, description="必需消费者编号（设备内唯一，登记后不可删除）"
+    )
+
+
+class BatchConfirmRequest(BaseModel):
+    """必需消费者对单个设备批次的处理确认。
+
+    携带 ``consumer_id``、``sequence`` 与批次上传时服务端返回的
+    ``batch_digest``：允许乱序（稀疏确认，缺号只阻塞该消费者水位）、允许并发
+    与重复提交。仅当批次存在且摘要相符时接受；相同确认幂等
+    （``already_confirmed``），同序号已以不同摘要确认返回 409。
+    """
+
+    consumer_id: str = Field(min_length=1, max_length=128, description="已登记的必需消费者编号")
+    sequence: int = Field(ge=1, description="被确认批次的序号")
+    batch_digest: str = Field(description="被确认批次的摘要（64 位十六进制 SHA-256）")
+
+    @field_validator("batch_digest")
+    @classmethod
+    def _normalize_digest(cls, v: str) -> str:
+        s = (v or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", s):
+            raise ValueError("batch_digest must be a 64-char lowercase hex sha256")
+        return s
+
+
 class BatchUploadRequest(BaseModel):
     """现场设备批次上传：链式追加一批观测，保存时间戳与判定阈值，不判定。
 
