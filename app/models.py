@@ -188,3 +188,36 @@ class BatchUploadRequest(BaseModel):
                     "observations must be strictly increasing by (captured_at, local_id)"
                 )
         return v
+
+
+class ConsumerRegisterRequest(BaseModel):
+    """登记设备的必需下游消费者。
+
+    登记后即成为设备的必需消费者，不可删除；安全归档水位
+    （``safe_sequence``）恒取全部已登记消费者水位的最小值。
+    """
+
+    consumer_id: str = Field(
+        min_length=1, max_length=128, description="必需消费者编号（设备内唯一）"
+    )
+
+
+class BatchAckRequest(BaseModel):
+    """下游消费者对单个批次的处理确认。
+
+    携带 ``consumer_id``、批次 ``sequence`` 与该批次 ``batch_digest``：
+    允许乱序、并发与重复提交。仅当批次存在且摘要相符时接受；重复确认幂等，
+    摘要冲突返回 409。
+    """
+
+    consumer_id: str = Field(min_length=1, max_length=128, description="已登记的必需消费者编号")
+    sequence: int = Field(ge=1, description="被确认批次的序号")
+    batch_digest: str = Field(description="被确认批次的 SHA-256 摘要（64 位十六进制）")
+
+    @field_validator("batch_digest")
+    @classmethod
+    def _normalize_batch_digest(cls, v: str) -> str:
+        s = (v or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", s):
+            raise ValueError("batch_digest must be a 64-char lowercase hex sha256")
+        return s

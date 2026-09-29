@@ -15,6 +15,19 @@
 - ``device_chains``：每个设备的链头游标（last_sequence、head_digest）与
   最近一次事件（受理或重放）的状态/序号/时刻。
 
+多下游消费者确认与安全归档水位：
+
+- ``device_consumers``：每台设备的**必需消费者**登记（注册后不可删除），
+  并缓存该消费者的连续确认水位 ``watermark``（已连续确认到的最大序号，
+  初始 0）；(device_id, consumer_id) 唯一；
+- ``device_batch_acks``：每个消费者对批次的**稀疏确认**（只保存已确认的
+  序号与当时摘要），(device_id, consumer_id, sequence) 唯一。
+
+确认在单个事务内「校验消费者与批次 → 插入稀疏确认 → 把该消费者水位推进
+至首个缺口」；写锁 + BEGIN IMMEDIATE 串行化并发确认，水位在事务内基于
+最新状态整体重算，不会丢失推进。设备的 ``safe_sequence`` 取所有必需
+消费者水位的最小值（无消费者或任一消费者水位为 0 时为 0）。
+
 批次提交在单个事务内完成「幂等/链头校验 → 追加记录 → 更新链头」；重放也在
 同一幂等事务内原子累加 ``replay_count`` 并刷新批次与链游标的最近事件——
 不新增批次、不推进链头、不改写首次受理响应。写锁 + BEGIN IMMEDIATE +
@@ -100,6 +113,23 @@ CREATE TABLE IF NOT EXISTS device_batches (
     UNIQUE (device_id, sequence),
     UNIQUE (device_id, batch_id)
 );
+CREATE TABLE IF NOT EXISTS device_consumers (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id      TEXT NOT NULL,
+    consumer_id    TEXT NOT NULL,
+    watermark      INTEGER NOT NULL DEFAULT 0,
+    registered_at  REAL NOT NULL,
+    UNIQUE (device_id, consumer_id)
+);
+CREATE TABLE IF NOT EXISTS device_batch_acks (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id        TEXT NOT NULL,
+    consumer_id      TEXT NOT NULL,
+    sequence         INTEGER NOT NULL,
+    batch_digest     TEXT NOT NULL,
+    confirmed_at     REAL NOT NULL,
+    UNIQUE (device_id, consumer_id, sequence)
+);
 """
 
 
@@ -137,6 +167,24 @@ class BatchConflict(Exception):
         }
         if existing is not None:
             self.detail["existing_batch"] = existing
+
+
+class ConsumerConflict(Exception):
+    """消费者确认冲突（HTTP 409）：摘要不符或消费者未登记，detail 附上下文。"""
+
+    def __init__(self, *, reason: str, message: str, **extra):
+        super().__init__(message)
+        self.detail = {"error": "consumer_conflict", "reason": reason, "message": message}
+        self.detail.update(extra)
+
+
+class BatchNotFound(Exception):
+    """确认的批次在该设备上不存在（HTTP 404）。"""
+
+    def __init__(self, device_id: str, sequence: int):
+        super().__init__(f"batch {sequence} of device {device_id!r} not found")
+        self.device_id = device_id
+        self.sequence = sequence
 
 
 def _iso(ts: float | None) -> str | None:
@@ -771,4 +819,224 @@ class Database:
             "observations": json.loads(r["observations"]),
             "thresholds": json.loads(r["thresholds"]),
             "created_at": _iso(r["created_at"]),
+        }
+
+    # ---------------- 必需消费者登记 / 批次确认 / 归档水位 ----------------
+
+    def register_consumer(self, device_id: str, consumer_id: str) -> tuple[dict, bool]:
+        """登记设备的必需下游消费者；登记后不可删除。
+
+        同一 ``(device_id, consumer_id)`` 重复登记幂等：返回既有登记信息并以
+        ``created=False`` 标记。新登记 ``created=True``。设备本身无需预先存在
+        （消费者可在任何批次上传之前登记）。
+        """
+        now = time.time()
+        with self._write_tx() as conn:
+            existing = conn.execute(
+                "SELECT consumer_id, watermark, registered_at FROM device_consumers "
+                "WHERE device_id = ? AND consumer_id = ?",
+                (device_id, consumer_id),
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "status": "already_registered",
+                    "device_id": device_id,
+                    "consumer_id": consumer_id,
+                    "watermark": existing["watermark"],
+                    "registered_at": _iso(existing["registered_at"]),
+                }, False
+            conn.execute(
+                "INSERT INTO device_consumers (device_id, consumer_id, watermark, registered_at) "
+                "VALUES (?, ?, 0, ?)",
+                (device_id, consumer_id, now),
+            )
+            return {
+                "status": "registered",
+                "device_id": device_id,
+                "consumer_id": consumer_id,
+                "watermark": 0,
+                "registered_at": _iso(now),
+            }, True
+
+    @staticmethod
+    def _consumer_statuses(conn, device_id: str, head_sequence: int = -1) -> list[dict]:
+        """组装各消费者水位与首个缺口（水位之后的第一个未确认序号）。
+
+        水位定义为「从 1 起连续确认的最大序号」，因此首个缺口恒为
+        ``watermark + 1``；当已追平链头（``watermark == head_sequence``）时
+        链上再无缺口，返回 ``None``。
+        """
+        consumers = conn.execute(
+            "SELECT id, consumer_id, watermark, registered_at FROM device_consumers "
+            "WHERE device_id = ? ORDER BY id",
+            (device_id,),
+        ).fetchall()
+        statuses: list[dict] = []
+        for c in consumers:
+            watermark = c["watermark"]
+            first_gap = None if 0 <= head_sequence <= watermark else watermark + 1
+            statuses.append(
+                {
+                    "consumer_id": c["consumer_id"],
+                    "watermark": watermark,
+                    "first_gap": first_gap,
+                    "registered_at": _iso(c["registered_at"]),
+                }
+            )
+        return statuses
+
+    def acknowledge_batch(
+        self, device_id: str, consumer_id: str, sequence: int, batch_digest: str
+    ) -> tuple[dict, bool]:
+        """单事务保存消费者的稀疏确认并把其连续水位推进至首个缺口。
+
+        允许乱序、并发及重复提交。仅接受已存在且摘要相符的批次：批次不存在
+        返回 404；消费者未登记或摘要冲突返回 409（:class:`ConsumerConflict`）。
+        相同确认（同一消费者/序号/摘要）幂等，HTTP 200 且 ``status=duplicate``；
+        新确认 HTTP 201 且 ``status=confirmed``。
+
+        水位在写事务内按最新稀疏确认整体重算（从当前水位的下一个序号起逐个
+        找首个缺口），并发确认由写锁串行化，不会丢失推进。
+        """
+        now = time.time()
+        with self._write_tx() as conn:
+            consumer = conn.execute(
+                "SELECT id, watermark FROM device_consumers "
+                "WHERE device_id = ? AND consumer_id = ?",
+                (device_id, consumer_id),
+            ).fetchone()
+            if consumer is None:
+                raise ConsumerConflict(
+                    reason="consumer_not_registered",
+                    message=(
+                        f"consumer {consumer_id!r} is not registered as a required "
+                        f"consumer of device {device_id!r}; register it before "
+                        "acknowledging batches"
+                    ),
+                    device_id=device_id,
+                    consumer_id=consumer_id,
+                )
+            batch = conn.execute(
+                "SELECT digest FROM device_batches WHERE device_id = ? AND sequence = ?",
+                (device_id, sequence),
+            ).fetchone()
+            if batch is None:
+                # 404 在路由层按 BatchNotFound 处理
+                raise BatchNotFound(device_id, sequence)
+            if batch["digest"] != batch_digest:
+                raise ConsumerConflict(
+                    reason="digest_mismatch",
+                    message=(
+                        f"batch_digest does not match batch {sequence} of device "
+                        f"{device_id!r}: acknowledgment refused"
+                    ),
+                    device_id=device_id,
+                    consumer_id=consumer_id,
+                    sequence=sequence,
+                    provided_digest=batch_digest,
+                    expected_digest=batch["digest"],
+                )
+
+            existing = conn.execute(
+                "SELECT batch_digest, confirmed_at FROM device_batch_acks "
+                "WHERE device_id = ? AND consumer_id = ? AND sequence = ?",
+                (device_id, consumer_id, sequence),
+            ).fetchone()
+            created = False
+            if existing is None:
+                # 唯一约束兜底并发：同一 (消费者, 序号) 只可能有一条确认，
+                # 摘要不符的并发写入会在此处转为 digest_mismatch 409
+                try:
+                    conn.execute(
+                        "INSERT INTO device_batch_acks "
+                        "(device_id, consumer_id, sequence, batch_digest, confirmed_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (device_id, consumer_id, sequence, batch_digest, now),
+                    )
+                except sqlite3.IntegrityError:
+                    existing = conn.execute(
+                        "SELECT batch_digest, confirmed_at FROM device_batch_acks "
+                        "WHERE device_id = ? AND consumer_id = ? AND sequence = ?",
+                        (device_id, consumer_id, sequence),
+                    ).fetchone()
+                    if existing["batch_digest"] != batch_digest:
+                        raise ConsumerConflict(
+                            reason="digest_mismatch",
+                            message=(
+                                f"batch {sequence} already acknowledged with a different "
+                                "digest by this consumer"
+                            ),
+                            device_id=device_id,
+                            consumer_id=consumer_id,
+                            sequence=sequence,
+                            provided_digest=batch_digest,
+                            expected_digest=existing["batch_digest"],
+                        )
+                else:
+                    created = True
+
+            # 在同一事务内基于最新稀疏确认把水位推进至首个缺口：
+            # 从当前水位 + 1 起，连续存在的确认序号逐个越过，遇到缺口即停。
+            watermark = consumer["watermark"]
+            while True:
+                nxt = conn.execute(
+                    "SELECT 1 FROM device_batch_acks "
+                    "WHERE device_id = ? AND consumer_id = ? AND sequence = ?",
+                    (device_id, consumer_id, watermark + 1),
+                ).fetchone()
+                if nxt is None:
+                    break
+                watermark += 1
+            if watermark != consumer["watermark"]:
+                conn.execute(
+                    "UPDATE device_consumers SET watermark = ? WHERE id = ?",
+                    (watermark, consumer["id"]),
+                )
+
+            confirmed_at = _iso(now if existing is None else existing["confirmed_at"])
+            body = {
+                "status": "confirmed" if created else "duplicate",
+                "device_id": device_id,
+                "consumer_id": consumer_id,
+                "sequence": sequence,
+                "batch_digest": batch_digest,
+                "watermark": watermark,
+                "confirmed_at": confirmed_at,
+            }
+        body["safe_sequence"] = self.get_archive_status(device_id)["safe_sequence"]
+        return body, created
+
+    def get_archive_status(self, device_id: str) -> dict:
+        """设备的多消费者归档状态：各水位、首个缺口与阻塞消费者。
+
+        ``safe_sequence`` 取所有必需消费者水位的最小值；尚无消费者或任一消费
+        者尚未确认任何批次时为 0。``first_gap`` 为安全前缀之后的首个待归档
+        序号（``safe_sequence + 1``）；``blocking_consumers`` 列出水位等于该
+        最小值且尚未追平链头的消费者（空列表表示链上批次已全部可安全归档）。
+        不删除任何原批次。
+        """
+        with closing(self._connect()) as conn:
+            chain = conn.execute(
+                "SELECT last_sequence FROM device_chains WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()
+            head_sequence = chain["last_sequence"] if chain is not None else 0
+            statuses = self._consumer_statuses(conn, device_id, head_sequence)
+
+        if not statuses:
+            safe_sequence = 0
+            blocking: list[str] = []
+        else:
+            safe_sequence = min(s["watermark"] for s in statuses)
+            blocking = sorted(
+                s["consumer_id"] for s in statuses if s["watermark"] == safe_sequence
+            ) if safe_sequence < head_sequence else []
+        return {
+            "device_id": device_id,
+            "head_sequence": head_sequence,
+            "consumer_count": len(statuses),
+            "safe_sequence": safe_sequence,
+            "first_gap": safe_sequence + 1,
+            "blocking_consumers": blocking,
+            "consumers": statuses,
         }

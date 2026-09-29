@@ -5,9 +5,19 @@ from fastapi import FastAPI, HTTPException, Path, Query, Response
 
 from . import config
 from .align import AidPattern, judge
-from .db import BatchConflict, Database, VersionConflict, VersionNotFound, VersionStateError
+from .db import (
+    BatchConflict,
+    BatchNotFound,
+    ConsumerConflict,
+    Database,
+    VersionConflict,
+    VersionNotFound,
+    VersionStateError,
+)
 from .models import (
+    BatchAckRequest,
     BatchUploadRequest,
+    ConsumerRegisterRequest,
     JudgeRequest,
     LibraryImportRequest,
     PatrolAnalyzeRequest,
@@ -27,8 +37,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "激活时单事务校验 base_version 仍是当前版本，冲突返回 409。"
             "现场设备按链式批次上传观测：批次摘要以前一批摘要链接，"
             "单事务校验并追加，相同载荷重放返回原结果，冲突返回 409 及期望值。"
+            "多下游处理方先登记为必需消费者，再以 consumer_id/sequence/batch_digest "
+            "确认批次（乱序、并发、重复安全）；设备 safe_sequence 取各消费者连续"
+            "水位最小值，给出可安全归档的连续前缀。"
         ),
-        version="1.4.0",
+        version="1.5.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -372,6 +385,72 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if row is None:
             raise HTTPException(status_code=404, detail="batch not found")
         return row
+
+    # ---------------- 多下游消费者：登记 / 确认 / 归档水位 ----------------
+
+    @app.post(
+        "/field-devices/{device_id}/consumers",
+        status_code=201,
+        summary="登记设备的必需下游消费者（不可删除）",
+        description=(
+            "登记后该消费者成为设备的必需消费者，参与 safe_sequence 最小值计算；"
+            "消费者只能登记、不能删除。重复登记同一 consumer_id 幂等"
+            "（HTTP 200，status=already_registered）。"
+        ),
+    )
+    def register_device_consumer(
+        req: ConsumerRegisterRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        body, created = app.state.db.register_consumer(device_id, req.consumer_id)
+        if not created:
+            response.status_code = 200
+        return body
+
+    @app.post(
+        "/field-devices/{device_id}/acknowledgments",
+        status_code=201,
+        summary="下游消费者确认已处理一个批次（允许乱序、并发、重复）",
+        description=(
+            "确认携带 consumer_id、sequence 与 batch_digest。仅接受已存在且"
+            "摘要相符的批次：批次不存在返回 404；消费者未登记或摘要冲突返回 409"
+            "（digest_mismatch 附 expected_digest）。相同确认幂等"
+            "（HTTP 200，status=duplicate）；新确认 HTTP 201（status=confirmed）。"
+            "稀疏确认与连续水位推进在单个 SQLite 事务内完成，并发确认不会丢失推进。"
+        ),
+    )
+    def acknowledge_device_batch(
+        req: BatchAckRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        try:
+            body, created = app.state.db.acknowledge_batch(
+                device_id, req.consumer_id, req.sequence, req.batch_digest
+            )
+        except ConsumerConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        except BatchNotFound as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "batch_not_found",
+                    "message": str(exc),
+                    "device_id": exc.device_id,
+                    "sequence": exc.sequence,
+                },
+            )
+        if not created:
+            response.status_code = 200
+        return body
+
+    @app.get(
+        "/field-devices/{device_id}/archive-status",
+        summary="查询设备安全归档水位（各消费者水位、首个缺口与阻塞消费者）",
+    )
+    def get_device_archive_status(device_id: str = Path(min_length=1, max_length=128)) -> dict:
+        return app.state.db.get_archive_status(device_id)
 
     return app
 

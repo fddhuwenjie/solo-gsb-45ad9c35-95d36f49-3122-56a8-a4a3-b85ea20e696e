@@ -24,6 +24,15 @@
 （不新增批次、不推进链头、不改写首次受理响应），返回原结果（`status=replayed`），
 载荷变化或链头过期返回 409 及期望值，并发提交与并发重放都不会形成分叉或丢计数。
 
+同一台设备的批次会被**多个下游处理方**消费（如归档、分析、备份）。各处理方
+先登记为设备的**必需消费者**（登记后不可删除），再以
+`consumer_id` + `sequence` + `batch_digest` 确认自己已处理完的批次——允许乱序、
+并发与重复提交，仅接受已存在且摘要相符的批次，相同确认幂等，摘要冲突返回 409。
+每个消费者在**同一 SQLite 事务**内保存稀疏确认并把连续水位推进到首个缺口；
+设备的 `safe_sequence` 取全部必需消费者水位的最小值，即所有处理方都已确认、
+**可安全归档的连续前缀**（尚无消费者或任一消费者未确认任何批次时为 0）。
+状态接口列出各消费者水位、首个缺口与阻塞消费者；确认只追加记录，**不删除原批次**。
+
 ## 快速开始
 
 单条命令启动（唯一前置要求：Docker 与 Docker Compose）：
@@ -74,6 +83,9 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `GET` | `/field-devices/{device_id}/cursor` | 查询设备批次链游标（链头摘要、下一批期望值与最近事件状态/序号/时刻） |
 | `GET` | `/field-devices/{device_id}/batches` | 按 `after_sequence` 游标分页列出设备批次（首次受理状态 + 重放计数） |
 | `GET` | `/field-devices/{device_id}/batches/{sequence}` | 查询单条批次详情（观测时间戳、`/judge` 四项阈值与重放计数） |
+| `POST` | `/field-devices/{device_id}/consumers` | 登记设备的必需下游消费者（不可删除；重复登记幂等） |
+| `POST` | `/field-devices/{device_id}/acknowledgments` | 消费者确认已处理批次（`consumer_id`/`sequence`/`batch_digest`；乱序/并发/重复安全，冲突 409） |
+| `GET` | `/field-devices/{device_id}/archive-status` | 查询安全归档水位：`safe_sequence`、首个缺口、各消费者水位与阻塞消费者 |
 
 ### 1. 导入特征库（原子发布新版本）
 
@@ -396,6 +408,112 @@ curl -s "http://localhost:8000/field-devices/dev-01/batches?after_sequence=2&lim
 curl -s http://localhost:8000/field-devices/dev-01/batches/2
 ```
 
+### 7. 多处理方确认与安全归档水位（safe_sequence）
+
+同一台设备的批次会被多个下游处理方消费。服务端为每台设备维护必需消费者
+登记、稀疏确认与连续水位，给出**全部处理方都确认完毕、可安全归档的连续
+前缀**：
+
+- **登记必需消费者**（只增不删）：
+  `POST /field-devices/{device_id}/consumers`，请求体 `{"consumer_id": "..."}`。
+  登记后该消费者即参与 `safe_sequence` 最小值计算；重复登记同一
+  `consumer_id` 幂等（HTTP 200，`status=already_registered`）。消费者可在任何
+  批次上传之前登记；
+- **确认批次**：`POST /field-devices/{device_id}/acknowledgments`，请求体为
+  `consumer_id`、`sequence`、`batch_digest`（即上传响应中的 `digest`）。
+  允许**乱序、并发、重复**提交：
+  - 仅接受**已存在且摘要相符**的批次：批次不存在返回 404，消费者未登记或
+    摘要冲突返回 409（`reason=digest_mismatch`，`detail.expected_digest`
+    给出服务端保存的摘要）；
+  - 相同确认幂等：新确认 HTTP 201（`status=confirmed`），重复确认 HTTP 200
+    （`status=duplicate`，保留首次 `confirmed_at`）；
+- **水位推进**：每个消费者的确认是稀疏集合；保存确认与把连续水位
+  （`watermark`：从 1 起连续确认到的最大序号）推进至**首个缺口**在**同一个
+  SQLite 事务**内完成，写锁 + `BEGIN IMMEDIATE` 串行化并发确认，推进不会
+  丢失、不会回退；
+- **安全归档水位**：`safe_sequence = min(所有必需消费者的 watermark)`。
+  尚无消费者，或任一消费者尚未确认任何批次时为 `0`；只有前缀
+  `1..safe_sequence` 可安全归档。确认只追加记录，**不删除任何原批次**。
+
+**多处理方确认示例**（两个处理方 `archiver` 与 `ml-pipeline` 各跑各的，
+乱序确认互不影响）：
+
+```bash
+DEV=http://localhost:8000/field-devices/dev-01
+
+# ① 登记两个必需消费者（登记后不可删除；重复登记幂等）
+curl -s -X POST $DEV/consumers -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "archiver"}'
+# → 201 {"status": "registered", "consumer_id": "archiver", "watermark": 0, ...}
+curl -s -X POST $DEV/consumers -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "ml-pipeline"}'
+
+# ② 设备照常上传链式批次（见上一节），取每批响应中的 digest
+#    下面的 $D1 / $D2 分别为 seq1 / seq2 上传响应中的 digest
+D1=…; D2=…
+
+# ③ 处理方各自确认（携带 consumer_id / sequence / batch_digest）
+#    乱序也安全：archiver 先确认 seq2 不会推进水位（seq1 是缺口）
+curl -s -X POST $DEV/acknowledgments -H 'Content-Type: application/json' \
+  -d "{\"consumer_id\": \"archiver\", \"sequence\": 2, \"batch_digest\": \"$D2\"}"
+# → 201 {"status": "confirmed", "watermark": 0, "safe_sequence": 0, ...}
+curl -s -X POST $DEV/acknowledgments -H 'Content-Type: application/json' \
+  -d "{\"consumer_id\": \"archiver\", \"sequence\": 1, \"batch_digest\": \"$D1\"}"
+# → 201 {"status": "confirmed", "watermark": 2, "safe_sequence": 0, ...}
+#    archiver 已到 2，但 ml-pipeline 尚未确认 → 设备 safe_sequence 仍是 0
+
+# 相同确认重复提交幂等（重试安全）：HTTP 200，status=duplicate
+curl -s -X POST $DEV/acknowledgments -H 'Content-Type: application/json' \
+  -d "{\"consumer_id\": \"archiver\", \"sequence\": 1, \"batch_digest\": \"$D1\"}"
+
+# 摘要不符 → 409，detail 给出服务端保存的 expected_digest
+curl -s -X POST $DEV/acknowledgments -H 'Content-Type: application/json' \
+  -d "{\"consumer_id\": \"archiver\", \"sequence\": 1, \"batch_digest\": \"00…00\"}"
+# → 409 {"detail": {"error": "consumer_conflict", "reason": "digest_mismatch",
+#        "sequence": 1, "provided_digest": "00…00", "expected_digest": "<D1>"}}
+
+# ④ ml-pipeline 也确认 seq1 后，连续前缀推进到 1
+curl -s -X POST $DEV/acknowledgments -H 'Content-Type: application/json' \
+  -d "{\"consumer_id\": \"ml-pipeline\", \"sequence\": 1, \"batch_digest\": \"$D1\"}"
+# → 201 {"status": "confirmed", "watermark": 1, "safe_sequence": 1, ...}
+```
+
+**状态查询**：`GET /field-devices/{device_id}/archive-status` 返回链头、
+`safe_sequence`、首个缺口、阻塞消费者与每个消费者的水位/缺口：
+
+```bash
+curl -s $DEV/archive-status
+```
+
+```json
+{
+  "device_id": "dev-01",
+  "head_sequence": 2,
+  "consumer_count": 2,
+  "safe_sequence": 1,
+  "first_gap": 2,
+  "blocking_consumers": ["ml-pipeline"],
+  "consumers": [
+    {"consumer_id": "archiver", "watermark": 2, "first_gap": null,
+     "registered_at": "…"},
+    {"consumer_id": "ml-pipeline", "watermark": 1, "first_gap": 2,
+     "registered_at": "…"}
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `safe_sequence` | 所有必需消费者水位的最小值；可安全归档的连续前缀 `1..safe_sequence`。无消费者或任一消费者水位为 0 时为 `0` |
+| `first_gap` | 安全前缀之后的首个待归档序号（恒为 `safe_sequence + 1`） |
+| `blocking_consumers` | 水位等于该最小值且尚未追平链头的消费者（按编号排序）；全部追平或链上无批次时为空列表 |
+| `consumers[].watermark` | 该消费者从 1 起连续确认到的最大序号（乱序确认只填空缺，不越过首个缺口） |
+| `consumers[].first_gap` | 该消费者水位之后的首个缺口；已追平链头时为 `null` |
+
+归档作业只需轮询该接口并归档 `sequence <= safe_sequence` 的批次；`consumers`
+与 `blocking_consumers` 可用于定位卡在哪个处理方。确认记录与原批次始终保留，
+不做物理删除。
+
 ## 判定模型与裁决规则
 
 **观测模型**：观测时钟相对真时存在线性钟漂与固定相位差，
@@ -445,7 +563,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链共 55 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认共 74 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 
@@ -458,7 +576,8 @@ app/
   patrol.py  巡检整体核对：窗口合格候选 + 全局最优分配动态规划
   batches.py 现场设备批次：规范化载荷与 SHA-256 链式摘要
   models.py  请求数据模型（Pydantic）
-  db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 设备批次链，含首次迁移）
+  db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 设备批次链 +
+             多消费者稀疏确认与安全归档水位，含首次迁移）
   config.py  环境变量配置
 samples/
   library.json                示例特征库
